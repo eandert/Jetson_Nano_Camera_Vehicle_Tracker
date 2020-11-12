@@ -1,11 +1,19 @@
 # decompyle3 version 3.3.2
 # Python bytecode 3.7 (3394)
 # Decompiled from: Python 3.7.1 (v3.7.1:260ec2c36a, Oct 20 2018, 14:57:15) [MSC v.1915 64 bit (AMD64)]
-# Embedded file name: C:\Yolo_v4\darknet\build\darknet\x64\car_video_rec.py
 # Compiled at: 2020-08-28 19:43:12
 # Size of source mod 2**32: 19704 bytes
 from ctypes import *
-import sys, math, random, os, cv2, numpy as np, time, csv, time, os
+import sys, math, random, os, cv2, numpy as np, time, csv
+from flask import Response
+from flask import Flask
+from flask import render_template
+import threading
+
+app = Flask(__name__)
+
+outputFrame = None
+lock = threading.Lock()
 # Change folder so we can find where darknet is stored
 sys.path.insert(1, 'C:/Yolo_v4/darknet/build/darknet/x64')
 import darknet
@@ -120,9 +128,11 @@ class Tracked:
             for v in self.lastVelocity: sum += v
             self.velocity = sum/self.lastHistory
 
-        self.dX = (0.7*self.dX) + (0.3*(self.x - self.lastX))
-        self.dY = (0.7*self.dY) + (0.3*(self.y - self.lastY))
-        self.timeToIntercept = (0.3*(self.y / self.dY * (1 / 30.0))) + (0.7*self.timeToIntercept )
+        if self.x != self.lastX:
+            self.dX = (0.3*self.dX) + (0.7*(self.x - self.lastX))
+        if self.y != self.lastY:
+            self.dY = (0.3*self.dY) + (0.7*(self.y - self.lastY))
+        self.timeToIntercept = (0.7*(self.y / self.dY * (1 / 30.0))) + (0.3*self.timeToIntercept )
         self.lastX = self.x
         self.lastY = self.y
         self.lastTracked = time
@@ -299,10 +309,10 @@ class YOLO:
 
     def init(self, frame_width, frame_height, doImage, doWrite, timestamp):
         os.chdir('C:/Yolo_v4/darknet/build/darknet/x64/')
-        #configPath = './cfg/yolov4-tiny.cfg'
-        #weightPath = './weights/yolov4-tiny.weights'
         configPath = './cfg/yolov4-tiny.cfg'
         weightPath = './weights/yolov4-tiny.weights'
+        #configPath = './cfg/yolov4.cfg'
+        #weightPath = './weights/yolov4.weights'
         metaPath = './cfg/coco.data'
 
         self.network, self.class_names, self.class_colors = darknet.load_network(
@@ -389,11 +399,11 @@ class YOLO:
             name_tag = label
             for name_key, color_val in color_dict.items():
                 if name_key == name_tag:
-                    cameraAdjustementAngle = 15.0
-                    hFOV = 157.0  # 2 * math.atan( / focalLength)
+                    cameraAdjustementAngle = 15.0 * 2.0
+                    hFOV = 157.0 # 2 * math.atan( / focalLength)
                     vFOV = 155.0
-                    imageWidth = 1920
-                    imageHeight = 1080
+                    imageWidth = int(1920/2)
+                    imageHeight = int(1080/2)
                     #focalLength = 98.9 * (hFOV/2.9)
                     focalLength = imageHeight / 2 / math.tan(vFOV / 2.0)
                     #focalLength = 5
@@ -417,21 +427,21 @@ class YOLO:
                         ObjectHeight = 1.8
                     SensorHeight = 1.25 #21.21
                     ObjectHeightOnSensor = SensorHeight * h / imageHeight
-                    distancei = (focalLength * ObjectHeight)/ObjectHeightOnSensor
+                    distancei = (focalLength * ObjectHeight)/ObjectHeightOnSensor * 2.0
                     if name_key in tracked_items:
                         # Old way
                         #detections_position_list.append([x, y, w, h])
                         # New Way
                         #sin(x_dist/dist)
                         # Calculate x and y position based on camera FOV
-                        angle = math.radians(((x-(imageWidth/2.0)) * (hFOV/imageWidth)) + cameraAdjustementAngle)
+                        angle = math.radians(((x-(imageWidth/2.0)) * (hFOV/imageWidth))*2.0 + cameraAdjustementAngle)
                         x_actual = math.sin(angle) * distancei / 1000.0
                         y_actual = distancei / 1000.0
                         xmin, ymin, xmax, ymax = convertBack(float(x), float(y),
                                                              float(w), float(h))
                         detections_position_list.append([xmin, ymin, xmax, ymax])
                         # Calculate the crosssection (width) of vehicle being detected for error math
-                        crossSection = math.sin(math.radians((xmax - xmin) * (SensorHeight / 1920))) * distancei
+                        crossSection = math.sin(math.radians((xmax - xmin) * (SensorHeight / imageWidth))) * distancei
                         detections_list.append([tracked_items.index(name_key), confidence * 100, x_actual, y_actual, crossSection])
                         # pt1 = (xmin, ymin)
                         # pt2 = (xmax, ymax)
@@ -503,6 +513,7 @@ class YOLO:
             self.out.write(image)
         print(" Print to screen framerate: ", 1 / (time.time() - ptime))
         self.prev_time = timestamp
+        return image
         #except Exception as e:
         #    print(e)
         #    return timestamp, []
@@ -652,29 +663,90 @@ class YOLO:
         self.out.release()
 
 
-def processImages(q):
+def processImages():
     global firstIteration
     global yolo
 
-    print ( "Producer: Process image called! ")
+    # grab global references to the output frame and lock variables
+    global outputFrame, lock
 
-    # Check for images, timestamps in the queue
-    while 1:
-        if not q.empty():
-            # Get the image from the queue
-            jpg = q.get()
+    # Fill in your details here to be posted to the login form.
+    # cap = cv2.VideoCapture(0)                                      # Uncomment to use Webcam
+    os.chdir("A:\\Users\edwar\Downloads")
+    cap = cv2.VideoCapture("2018_04_05_200511.MOV")  # Local Stored video detection - Set input video
+    frame_width = int(cap.get(3))  # Returns the width and height of capture video
+    frame_height = int(cap.get(4))
+    # Set out for video writer
 
-            # Do the opencv image parsing
-            i = jpg[0]
+    currentTime = 0.0
+    fps = 30.0
 
+    while True:  # Load the input frame and write output frame.
+        ret, frame_read = cap.read()  # Capture frame and return true if frame present
+        # For Assertion Failed Error in OpenCV
+        if not ret:  # Check if frame present otherwise he break the while loop
+            cap.set(cv2.cv.CV_CAP_PROP_POS_FRAMES, 0)
+        else:
+            height, width, layers = frame_read.shape
+            new_h = int(height / 2)
+            new_w = int(width / 2)
+            frame_read = cv2.resize(frame_read, (new_w, new_h))
             # We do some special setup if this is the first frame, otherwise just send the image
             if firstIteration:
                 # Setup the variables we need, hopefully this function stays active
                 yolo = YOLO()
-                height, width = i.shape[:2]
+                height, width = frame_read.shape[:2]
                 #print(width, height)
-                yolo.init(width, height, True, False, jpg[1])
+                yolo.init(width, height, False, False, currentTime)
                 firstIteration = False
-            #print("Producer: Got an image at ", jpg[1])
-            yolo.readFrame(i, jpg[1])
+            else:
+                #print("Producer: Got an image at ", jpg[1])
+                result = yolo.readFrame(frame_read, currentTime)
+
+                with lock:
+                    if result is not None:
+                        outputFrame = result.copy()
+
+                currentTime += 1.0 / fps
             #print ( "Sending tracks ", result)
+
+def generate():
+    # grab global references to the output frame and lock variables
+    global outputFrame, lock
+    # loop over frames from the output stream
+    while True:
+        # wait until the lock is acquired
+        with lock:
+            # check if the output frame is available, otherwise skip
+            # the iteration of the loop
+            if outputFrame is None:
+                continue
+            # encode the frame in JPEG format
+            (flag, encodedImage) = cv2.imencode(".jpg", outputFrame)
+            # ensure the frame was successfully encoded
+            if not flag:
+                continue
+        # yield the output frame in the byte format
+        yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' +
+               bytearray(encodedImage) + b'\r\n')
+
+@app.route("/")
+def index():
+    # return the rendered template
+    return render_template("index.html")
+
+@app.route("/video_feed")
+def video_feed():
+    # return the response generated along with the specific media
+    # type (mime type)
+    return Response(generate(),
+        mimetype = "multipart/x-mixed-replace; boundary=frame")
+
+if __name__ == '__main__':
+
+    # start a thread that will perform motion detection
+    t = threading.Thread(target=processImages, args=())
+    t.daemon = True
+    t.start()
+
+    app.run(host='0.0.0.0')
