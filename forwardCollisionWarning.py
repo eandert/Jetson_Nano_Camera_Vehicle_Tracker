@@ -4,25 +4,38 @@
 # Compiled at: 2020-08-28 19:43:12
 # Size of source mod 2**32: 19704 bytes
 from ctypes import *
-import sys, math, random, os, cv2, numpy as np, time, csv
+import sys, math, random, os, cv2, numpy as np, time, csv, socket
 from flask import Response
 from flask import Flask
 from flask import render_template
 import threading
+import nanocamera as nano
+import argparse
 
 app = Flask(__name__)
 
 outputFrame = None
 lock = threading.Lock()
+
 # Change folder so we can find where darknet is stored
+# Uncomment only if darknet is no tin the same folder as this python file
 sys.path.insert(1, 'C:/Yolo_v4/darknet/build/darknet/x64')
 import darknet
 
 from sklearn.neighbors import BallTree
 KDTREESEARCH_LIMIT = 10000
 
-class Tracked:
+class CameraSpecifications:
+    def __init__(self):
+        self.cameraAdjustmentAngle = -10.0
+        self.cameraHeight = 1.0
+        self.hFOV = 157.0  # 2 * math.atan( / focalLength)
+        self.vFOV = 155.0
+        self.imageWidth = 1280
+        self.imageHeight = 720
+        self.focalLength = self.imageHeight / 2 / math.tan(self.vFOV / 2.0)
 
+class Tracked:
     def __init__(self, xmin, ymin, xmax, ymax, type, confidence, x, y, crossSection, time, id):
         self.xmin = xmin
         self.ymin = ymin
@@ -132,7 +145,8 @@ class Tracked:
             self.dX = (0.3*self.dX) + (0.7*(self.x - self.lastX))
         if self.y != self.lastY:
             self.dY = (0.3*self.dY) + (0.7*(self.y - self.lastY))
-        self.timeToIntercept = (0.7*(self.y / self.dY * (1 / 30.0))) + (0.3*self.timeToIntercept )
+        if self.dY != 0:
+            self.timeToIntercept = (0.7*(self.y / self.dY * (1 / 30.0))) + (0.3*self.timeToIntercept )
         self.lastX = self.x
         self.lastY = self.y
         self.lastTracked = time
@@ -143,10 +157,7 @@ class Tracked:
         return X_hat_t, P_t
 
     def updateKalman(self, X_hat_t, P_t, Z_t, R_t, H_t):
-
         K_prime = P_t.dot(H_t.transpose()).dot(np.linalg.inv(H_t.dot(P_t).dot(H_t.transpose()) + R_t))
-        # print("K:\n",K_prime)
-        # print("X_hat:\n",X_hat_t)
         X_t = X_hat_t + K_prime.dot(Z_t - H_t.dot(X_hat_t))
         P_t = P_t - K_prime.dot(H_t).dot(P_t)
 
@@ -219,7 +230,6 @@ class Tracked:
             self.ymaxp = self.ymax
             return
 
-
 def convertBack(x, y, w, h):
     xmin = int(round(x - w / 2))
     xmax = int(round(x + w / 2))
@@ -228,32 +238,7 @@ def convertBack(x, y, w, h):
     return (
      xmin, ymin, xmax, ymax)
 
-
-# def computeDistance(bb0, bb1):
-#     x0 = bb0[0] - bb0[2] / 2
-#     x1 = bb0[0] + bb0[2] / 2
-#     y0 = bb0[1] - bb0[3] / 2
-#     y1 = bb0[1] + bb0[3] / 2
-#     x10 = bb1[0] - bb1[2] / 2
-#     x11 = bb1[0] + bb1[2] / 2
-#     y10 = bb1[1] - bb1[3] / 2
-#     y11 = bb1[1] + bb1[3] / 2
-#     xA = max(x0, x10)
-#     yA = max(y0, y10)
-#     xB = min(x1, x11)
-#     yB = min(y1, y11)
-#     interArea = max(0, xB - xA + 1) * max(0, yB - yA + 1)
-#     boxAArea = (x1 - x0 + 1) * (x1 - y0 + 1)
-#     boxBArea = (x11 - x10 + 1) * (x11 - y10 + 1)
-#     iou = interArea / float(boxAArea + boxBArea - interArea)
-#     if iou <= 0:
-#         distance = 1
-#     else:
-#         distance = 1 - iou
-#     return distance
-
 def computeDistance(a, b, epsilon=1e-5):
-
     """ Given two boxes `a` and `b` defined as a list of four numbers:
             [x1,y1,x2,y2]
         where:
@@ -297,17 +282,9 @@ def computeDistance(a, b, epsilon=1e-5):
         distance = 1 - iou
     return distance
 
-
-netMain = None
-metaMain = None
-altNames = None
-
-firstIteration = True
-yolo = None
-
 class YOLO:
 
-    def init(self, frame_width, frame_height, doImage, doWrite, timestamp):
+    def init(self, frame_width, frame_height, doImage, doWrite, timestamp, camSpecs):
         os.chdir('C:/Yolo_v4/darknet/build/darknet/x64/')
         configPath = './cfg/yolov4-tiny.cfg'
         weightPath = './weights/yolov4-tiny.weights'
@@ -321,7 +298,7 @@ class YOLO:
             weightPath,
             batch_size=1
         )
-
+        self.cameraSpecs = camSpecs
         self.frame_height = frame_height
         self.frame_width = frame_width
         self.showImage = doImage
@@ -329,7 +306,7 @@ class YOLO:
         if self.write:
             self.out = cv2.VideoWriter('output.avi', (cv2.VideoWriter_fourcc)(*'MJPG'), 10.0, (
              self.frame_width, self.frame_height))
-        print('Starting the YOLO...')
+        print('Starting YOLO...')
         self.darknet_image = darknet.make_image(frame_width, frame_height, 3)
         self.trackedList = []
         self.id = 0
@@ -387,8 +364,6 @@ class YOLO:
         total = 0
         tracked_items = [
          'car', 'truck', 'bus', 'motorbike']
-        localization_items = [
-            'traffic light',  'fire hydrant',  'stop sign',  'parking meter']
         detections_list = []
         detections_position_list = []
         for label, confidence, bbox in detections:
@@ -399,18 +374,6 @@ class YOLO:
             name_tag = label
             for name_key, color_val in color_dict.items():
                 if name_key == name_tag:
-                    cameraAdjustementAngle = 15.0 * 2.0
-                    hFOV = 157.0 # 2 * math.atan( / focalLength)
-                    vFOV = 155.0
-                    imageWidth = int(1920/2)
-                    imageHeight = int(1080/2)
-                    #focalLength = 98.9 * (hFOV/2.9)
-                    focalLength = imageHeight / 2 / math.tan(vFOV / 2.0)
-                    #focalLength = 5
-                    # = (2 * 3.14 * focalLength) / (w + h * 360) * 1000 + 3
-                    # 1/d_o + 1/d_i = 1/f.
-                    #ObjectHeight = 1.5
-                    # ObjectHeight =
                     if name_tag == 'car':
                         cars += 1
                         total += 1
@@ -425,50 +388,21 @@ class YOLO:
                         ObjectHeight = 3.0
                     else:
                         ObjectHeight = 1.8
-                    SensorHeight = 1.25 #21.21
-                    ObjectHeightOnSensor = SensorHeight * h / imageHeight
-                    distancei = (focalLength * ObjectHeight)/ObjectHeightOnSensor * 2.0
+                    ObjectHeightOnSensor = self.cameraSpecs.cameraHeight * h / self.cameraSpecs.imageHeight
+                    distancei = (self.cameraSpecs.focalLength * ObjectHeight)/ObjectHeightOnSensor
                     if name_key in tracked_items:
-                        # Old way
-                        #detections_position_list.append([x, y, w, h])
-                        # New Way
-                        #sin(x_dist/dist)
                         # Calculate x and y position based on camera FOV
-                        angle = math.radians(((x-(imageWidth/2.0)) * (hFOV/imageWidth))*2.0 + cameraAdjustementAngle)
+                        angle = math.radians(((x-(self.cameraSpecs.imageWidth/2.0)) * (self.cameraSpecs.hFOV/self.cameraSpecs.imageWidth)) + self.cameraSpecs.cameraAdjustmentAngle)
                         x_actual = math.sin(angle) * distancei / 1000.0
                         y_actual = distancei / 1000.0
                         xmin, ymin, xmax, ymax = convertBack(float(x), float(y),
                                                              float(w), float(h))
                         detections_position_list.append([xmin, ymin, xmax, ymax])
                         # Calculate the crosssection (width) of vehicle being detected for error math
-                        crossSection = math.sin(math.radians((xmax - xmin) * (SensorHeight / imageWidth))) * distancei
+                        crossSection = math.sin(math.radians((xmax - xmin) * (self.cameraSpecs.cameraHeight / self.cameraSpecs.imageWidth))) * distancei
                         detections_list.append([tracked_items.index(name_key), confidence * 100, x_actual, y_actual, crossSection])
-                        # pt1 = (xmin, ymin)
-                        # pt2 = (xmax, ymax)
-                        # cv2.rectangle(img, pt1, pt2, [8, 140, 38], 1)
-                        # cv2.putText(img, "NA" + ' t:' + str(name_tag) + ' d:' + str(
-                        #     distancei), (
-                        #                 pt1[0], pt1[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, [8, 140, 38], 2)
-                    # if name_key in localization_items:
-                    #     xmin, ymin, xmax, ymax = convertBack(float(x), float(y),
-                    #                                          float(w), float(h))
-                    #     pt1 = (xmin, ymin)
-                    #     pt2 = (xmax, ymax)
-                    #     cv2.rectangle(img, pt1, pt2, [8, 140, 38], 1)
-                    #     cv2.putText(img, "L" + ' t:' + str(name_tag) + ' d:' + str(
-                    #         distancei), (
-                    #                     pt1[0], pt1[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, [8, 140, 38], 2)
 
-        # for track in self.trackedList:
-        #     track.calcEstimatedPos(timestamp - self.prev_time)
-        #     pt1 = (track.xmin, track.ymin)
-        #     pt2 = (track.xmax, track.ymax)
-        #     color = color_dict[tracked_items[track.type]]
-        #     cv2.rectangle(img, pt1, pt2, color, 1)
-        #     cv2.putText(img, str(track.id) + ' t:' + str(tracked_items[track.type]) + ' d:' + str(
-        #         track.distance) + ' v:' + str(track.velocity), (
-        #                     pt1[0], pt1[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
+        # Call the matching function to modilfy our detections in trackedList
         self.matchDetections(detections_position_list, detections_list, timestamp)
 
         for detection in self.trackedList:
@@ -488,35 +422,25 @@ class YOLO:
                     round(detection.x, 2)) + ' y:' + str(round(detection.y, 2)), (
                                 pt1[0], pt1[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        print('Time:', timestamp, ' Total:', total, ' Cars:', cars, ' Trucks:', trucks, ' Buses:', buses)
         return img
 
     def readFrame(self, frame_read, timestamp):
-        #try:
-        ptime = time.time()
-        #darknet_image = self.darknet.make_image(self.frame_width, self.frame_height, 3)
         frame_rgb = cv2.cvtColor(frame_read, cv2.COLOR_BGR2RGB)
         frame_resized = cv2.resize(frame_rgb, (
          self.frame_width, self.frame_height),
           interpolation=(cv2.INTER_LINEAR))
         darknet.copy_image_from_bytes(self.darknet_image, frame_resized.tobytes())
         detections = darknet.detect_image(self.network, self.class_names, self.darknet_image, thresh=0.25)
-        #darknet.free_image(darknet_image)
         image = self.cvDrawBoxes(detections, frame_resized, timestamp)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        print(" Current YOLO Processing Framerate: ", 1 / (time.time() - ptime))
         if self.showImage:
             cv2.imshow('Demo', image)
             if cv2.waitKey(1) == 27:
                 exit(0)
         if self.write:
             self.out.write(image)
-        print(" Print to screen framerate: ", 1 / (time.time() - ptime))
         self.prev_time = timestamp
         return image
-        #except Exception as e:
-        #    print(e)
-        #    return timestamp, []
 
     def matchDetections(self, detections_list_positions, detection_list, timestamp):
         self.time += 1
@@ -532,11 +456,8 @@ class YOLO:
                     for trackedListIdx, track in enumerate(self.trackedList):
                         track.calcEstimatedPos(timestamp - self.prev_time)
                         tuple = thisFrameTrackTree.query((np.array([track.getPositionPredicted()])), k=length, return_distance=True)
-                        #print(track.id, len(tuple) , tuple)
-                        #if len(tuple[0]) != 0:
                         first = True
                         for IOUVsDetection, detectionIdx in zip(tuple[0][0], tuple[1][0]):
-                            #print(tup1[0], tup2[0])
                             if .95 >= IOUVsDetection >= 0:
                                 # Only grab the first match
                                 # Before determining if this is a match check if this detection has been matched already
@@ -557,10 +478,6 @@ class YOLO:
                                         # No matches in the list, go ahead and add
                                         matches.append([detectionIdx, trackedListIdx, IOUVsDetection])
                                         first = False
-
-                                    # Old way, eliminating
-                                    #track.relations.append([tup1[0], tup2[0]])
-                                    #first = True
                                 else:
                                     # The other matches need to be marked so they arent made into a new track
                                     # Set distance to 1 so we know this wasn't the main match
@@ -568,18 +485,11 @@ class YOLO:
                                         # No matches in the list, go ahead and add
                                         matches.append([detectionIdx, -99, 1])
 
-                        # Old method
-                        # if tuple[0][0][0] < 1:
-                        #     track.relations.append([tuple[0][0][0], tuple[1][0][0]])
-                        #     matches.append(tuple[1][0][0])
-
                 # update the tracks that made it through
                 for match in matches:
                     if match[1] != -99:
                         # Now append to the correct track
                         self.trackedList[match[1]].relations.append([match[0], match[2]])
-                        #self.trackedList[match[1]].update(detections_list_positions[match[0]],
-                        #             detection_list[match[0]], self.time, timestamp - self.prev_time)
 
                 # Old way
                 for track in self.trackedList:
@@ -588,11 +498,9 @@ class YOLO:
                         track.update(detections_list_positions[track.relations[0][0]], detection_list[track.relations[0][0]], self.time, timestamp - self.prev_time)
                     elif len(track.relations) > 1:
                         # if we have multiple matches, pick the best one
-                        #print(' 2 matches for! ', track.id)
                         max = 0
                         idx = -99
                         for rel in track.relations:
-                            #print ( " Comparing ", rel[0], rel[1])
                             if rel[1] < max:
                                 max = rel[1]
                                 idx = rel[0]
@@ -611,27 +519,18 @@ class YOLO:
                     tuple = thisFrameTrackTree.query((np.array([detections_list_positions[add]])), k=length,
                                                      return_distance=True)
                     first = True
-                    #print("Comparision IOU: ", add, tuple)
-                    #print("       List  : ", tuple[0], tuple[1])
                     for IOUVsDetection, detectionIdx in zip(tuple[0][0], tuple[1][0]):
-                        # print(tup1[0], tup2[0])
-                        #if add == tup2[0]:
-                        #print("Comparision IOU: ", tup1, tup2)
                         # Check to make sure thie IOU match is high
                         if .75 >= IOUVsDetection >= 0:
                             # Make sure this is not ourself
                             if add != detectionIdx:
                                 # If this is not ourself, add ourself only if none of our matches has been added yet
                                 if detectionIdx in added:
-                                    #print("Match found in added: ", add, detectionIdx)
                                     first = False
                                     break
-                            #else:
-                                #print ( "Ourself: ", add, detectionIdx )
 
                     # We are the best according to arbitrarily broken tie and can be added
                     if first:
-                        print ( "Adding: ", add )
                         added.append(add)
                         new = Tracked(detections_list_positions[add][0], detections_list_positions[add][1], detections_list_positions[add][2], detections_list_positions[add][3], detection_list[add][0], detection_list[add][1], detection_list[add][2], detection_list[add][3], detection_list[add][4], self.time, self.id)
                         if self.id < 1000000:
@@ -654,7 +553,6 @@ class YOLO:
             track.relations = []
             if track.lastTracked < self.time - 5:
                 remove.append(idx)
-                print ( " Removing ", idx)
 
         for delete in reversed(remove):
             self.trackedList.pop(delete)
@@ -663,52 +561,89 @@ class YOLO:
         self.out.release()
 
 
-def processImages():
-    global firstIteration
-    global yolo
+def processImages(useCamera, camSpecs):
+    firstIteration = True
+    yolo = None
 
     # grab global references to the output frame and lock variables
     global outputFrame, lock
 
-    # Fill in your details here to be posted to the login form.
-    # cap = cv2.VideoCapture(0)                                      # Uncomment to use Webcam
-    os.chdir("A:\\Users\edwar\Downloads")
-    cap = cv2.VideoCapture("2018_04_05_200511.MOV")  # Local Stored video detection - Set input video
-    frame_width = int(cap.get(3))  # Returns the width and height of capture video
-    frame_height = int(cap.get(4))
-    # Set out for video writer
+    if useCamera:
+        # Create the Camera instance
+        camera = nano.Camera(flip=2, width=1280, height=720, fps=30)
+        print('CSI Camera ready? - ', camera.isReady())
+        while camera.isReady():
+            try:
+                # read the camera image
+                frame_read = camera.read()
+                if firstIteration:
+                    # Setup the variables we need, hopefully this function stays active
+                    yolo = YOLO()
+                    height, width = frame_read.shape[:2]
+                    yolo.init(width, height, False, False, time.time(), camSpecs)
+                    firstIteration = False
 
-    currentTime = 0.0
-    fps = 30.0
+                    # Now that the init is done, lets get our IP and print to terminal so we know where to connect
+                    myip = [l for l in (
+                    [ip for ip in socket.gethostbyname_ex(socket.gethostname())[2] if not ip.startswith("127.")][:1], [
+                        [(s.connect(('8.8.8.8', 53)), s.getsockname()[0], s.close()) for s in
+                         [socket.socket(socket.AF_INET, socket.SOCK_DGRAM)]][0][1]]) if l][0][0]
+                    print("Please connect to http://" + str(myip) + ":5000 to see the video feed.")
+                else:
+                    result = yolo.readFrame(frame_read, time.time())
+                    with lock:
+                        if result is not None:
+                            outputFrame = result.copy()
+                    # Sleep just a bit so control-c works
+                    time.sleep(.001)
+                if cv2.waitKey(25) & 0xFF == ord('q'):
+                    break
+            except KeyboardInterrupt:
+                break
 
-    while True:  # Load the input frame and write output frame.
-        ret, frame_read = cap.read()  # Capture frame and return true if frame present
-        # For Assertion Failed Error in OpenCV
-        if not ret:  # Check if frame present otherwise he break the while loop
-            cap.set(cv2.cv.CV_CAP_PROP_POS_FRAMES, 0)
-        else:
-            height, width, layers = frame_read.shape
-            new_h = int(height / 2)
-            new_w = int(width / 2)
-            frame_read = cv2.resize(frame_read, (new_w, new_h))
-            # We do some special setup if this is the first frame, otherwise just send the image
-            if firstIteration:
-                # Setup the variables we need, hopefully this function stays active
-                yolo = YOLO()
-                height, width = frame_read.shape[:2]
-                #print(width, height)
-                yolo.init(width, height, False, False, currentTime)
-                firstIteration = False
+        # close the camera instance
+        camera.release()
+
+        # remove camera object
+        del camera
+    else:
+        #os.chdir("A:\\Users\edwar\Downloads")
+        cap = cv2.VideoCapture("video.avi")  # Local Stored video detection - Set input video
+
+        currentTime = 0.0
+        fps = 30.0
+
+        while True:  # Load the input frame and write output frame.
+            ret, frame_read = cap.read()  # Capture frame and return true if frame present
+            # For Assertion Failed Error in OpenCV
+            if not ret:  # Check if frame present otherwise he break the while loop
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             else:
-                #print("Producer: Got an image at ", jpg[1])
-                result = yolo.readFrame(frame_read, currentTime)
+                height, width, layers = frame_read.shape
+                new_h = int(height)
+                new_w = int(width)
+                frame_read = cv2.resize(frame_read, (new_w, new_h))
+                # We do some special setup if this is the first frame, otherwise just send the image
+                if firstIteration:
+                    # Setup the variables we need, hopefully this function stays active
+                    yolo = YOLO()
+                    height, width = frame_read.shape[:2]
+                    yolo.init(width, height, False, False, currentTime, camSpecs)
+                    firstIteration = False
 
-                with lock:
-                    if result is not None:
-                        outputFrame = result.copy()
-
-                currentTime += 1.0 / fps
-            #print ( "Sending tracks ", result)
+                    # Now that the init is done, lets get our IP and print to terminal so we know where to connect
+                    myip = [l for l in ([ip for ip in socket.gethostbyname_ex(socket.gethostname())[2] if not ip.startswith("127.")][:1], [[(s.connect(('8.8.8.8', 53)), s.getsockname()[0], s.close()) for s in [socket.socket(socket.AF_INET, socket.SOCK_DGRAM)]][0][1]]) if l][0][0]
+                    print("Please connect to http://" + str(myip) + ":5000 to see the video feed.")
+                else:
+                    result = yolo.readFrame(frame_read, currentTime)
+                    with lock:
+                        if result is not None:
+                            outputFrame = result.copy()
+                    currentTime += 1.0 / fps
+                    # Sleep just a bit so control-c works
+                    time.sleep(.001)
+                if cv2.waitKey(25) & 0xFF == ord('q'):
+                    break
 
 def generate():
     # grab global references to the output frame and lock variables
@@ -743,10 +678,23 @@ def video_feed():
         mimetype = "multipart/x-mixed-replace; boundary=frame")
 
 if __name__ == '__main__':
+    # Parse some arguements
+    parser = argparse.ArgumentParser(description='Detect vehicles ahead and warn of impending collision, can be run on camera or prerecorded video on Jetson Nano.')
+    parser.add_argument("--recorded", help="set the input as a pre-recorded video")
+    parser.add_argument('--height', type=float)
+    parser.add_argument('--angle', type=float)
+    args = parser.parse_args()
+
+    camSpecs = CameraSpecifications()
+    #if args.height:
+    #    camSpecs.cameraHeight = args.height
+    #if args.angle:
+    #    camSpecs.cameraAdjustmentAngle = args.angle
 
     # start a thread that will perform motion detection
-    t = threading.Thread(target=processImages, args=())
+    t = threading.Thread(target=processImages, args=(args.recorded, camSpecs, ))
     t.daemon = True
     t.start()
 
+    # Startup the web service
     app.run(host='0.0.0.0')
