@@ -1,9 +1,3 @@
-# decompyle3 version 3.3.2
-# Python bytecode 3.7 (3394)
-# Decompiled from: Python 3.7.1 (v3.7.1:260ec2c36a, Oct 20 2018, 14:57:15) [MSC v.1915 64 bit (AMD64)]
-# Compiled at: 2020-08-28 19:43:12
-# Size of source mod 2**32: 19704 bytes
-from ctypes import *
 import sys, math, random, os, cv2, numpy as np, time, csv, socket
 from flask import Response
 from flask import Flask
@@ -11,29 +5,50 @@ from flask import render_template
 import threading
 import nanocamera as nano
 import argparse
+from sklearn.neighbors import BallTree
+# Change folder so we can find where darknet is stored
+# Uncomment only if darknet is not in the same folder as this python file
+sys.path.insert(1, 'C:/Yolo_v4/darknet/build/darknet/x64')
+import darknet
 
 app = Flask(__name__)
 
 outputFrame = None
 lock = threading.Lock()
 
-# Change folder so we can find where darknet is stored
-# Uncomment only if darknet is no tin the same folder as this python file
-sys.path.insert(1, 'C:/Yolo_v4/darknet/build/darknet/x64')
-import darknet
-
-from sklearn.neighbors import BallTree
 KDTREESEARCH_LIMIT = 10000
 
+# This class holds the default camera configurations for the 2 recorded videos as well as the default guess for the
+# configuation outlined in the readme
 class CameraSpecifications:
-    def __init__(self):
-        self.cameraAdjustmentAngle = -10.0
-        self.cameraHeight = 1.0
-        self.hFOV = 157.0  # 2 * math.atan( / focalLength)
-        self.vFOV = 155.0
-        self.imageWidth = 1280
-        self.imageHeight = 720
-        self.focalLength = self.imageHeight / 2 / math.tan(self.vFOV / 2.0)
+    def __init__(self, defaultVehicle = False, defaultTrafficCam = True):
+        if defaultVehicle:
+            self.cameraAdjustmentAngle = -10.0
+            self.cameraHeight = 1.0
+            self.hFOV = 157.0  # 2 * math.atan( / focalLength)
+            self.vFOV = 155.0
+            self.imageWidth = 1280
+            self.imageHeight = 720
+            self.focalLength = self.imageHeight / 2 / math.tan(self.vFOV / 2.0)
+        elif defaultTrafficCam:
+            # Use default settign for pre-recorded traffic cam setup
+            self.cameraAdjustmentAngle = 0.0
+            self.cameraHeight = 2.0
+            self.hFOV = 157.0  # 2 * math.atan( / focalLength)
+            self.vFOV = 155.0
+            self.imageWidth = 1280
+            self.imageHeight = 720
+            self.focalLength = self.imageHeight / 2 / math.tan(self.vFOV / 2.0)
+        else:
+            # Guess the settings
+            self.cameraAdjustmentAngle = 0.0
+            self.cameraHeight = 1.5
+            self.hFOV = 157.0  # 2 * math.atan( / focalLength)
+            self.vFOV = 155.0
+            self.imageWidth = 1280
+            self.imageHeight = 720
+            self.focalLength = self.imageHeight / 2 / math.tan(self.vFOV / 2.0)
+
 
 class Tracked:
     def __init__(self, xmin, ymin, xmax, ymax, type, confidence, x, y, crossSection, time, id):
@@ -110,8 +125,9 @@ class Tracked:
         y_measured = other[3]# * 0.3048
         self.crossSection = other[4]# * 0.3048
 
-        # Kalman stuff
-        # We have to change the transition matrix every time with the changed timestep
+        # Kalman filter stuff
+        # We are changing the transition matrix every time with the changed timestep as sometimes the timestep is not consistent and
+        # we should account for extra change
         self.F_t = np.array([[1, 0, timePassed, 0], [0, 1, 0, timePassed], [0, 0, 1, 0], [0, 0, 0, 1]])
         X_hat_t, self.P_hat_t = self.predictionKalman(self.X_hat_t, self.P_t, self.F_t, self.B_t, self.U_t, self.Q_t)
         measure_with_error = np.array([x_measured, y_measured])
@@ -151,11 +167,13 @@ class Tracked:
         self.lastY = self.y
         self.lastTracked = time
 
+    # This is the predict function for the Kalman filter
     def predictionKalman(self, X_hat_t_1, P_t_1, F_t, B_t, U_t, Q_t):
         X_hat_t = F_t.dot(X_hat_t_1) + (B_t.dot(U_t).reshape(B_t.shape[0], -1))
         P_t = np.diag(np.diag(F_t.dot(P_t_1).dot(F_t.transpose()))) + Q_t
         return X_hat_t, P_t
 
+    # This is the update function for the Kalman filter
     def updateKalman(self, X_hat_t, P_t, Z_t, R_t, H_t):
         K_prime = P_t.dot(H_t.transpose()).dot(np.linalg.inv(H_t.dot(P_t).dot(H_t.transpose()) + R_t))
         X_t = X_hat_t + K_prime.dot(Z_t - H_t.dot(X_hat_t))
@@ -163,6 +181,7 @@ class Tracked:
 
         return X_t, P_t
 
+    # Gets our position in an array form so we can use it in the BallTree
     def getPosition(self):
         return [
          self.xmin, self.ymin, self.xmax, self.ymax]
@@ -239,6 +258,7 @@ def convertBack(x, y, w, h):
      xmin, ymin, xmax, ymax)
 
 def computeDistance(a, b, epsilon=1e-5):
+    # Shamelessly copied from tutorial http://ronny.rest/tutorials/module/localization_001/iou/#
     """ Given two boxes `a` and `b` defined as a list of four numbers:
             [x1,y1,x2,y2]
         where:
@@ -276,6 +296,7 @@ def computeDistance(a, b, epsilon=1e-5):
     # RATIO OF AREA OF OVERLAP OVER COMBINED AREA
     iou = area_overlap / (area_combined+epsilon)
 
+    # Modified to invert the IOU so that it works with the BallTree class
     if iou <= 0:
         distance = 1
     else:
@@ -284,39 +305,58 @@ def computeDistance(a, b, epsilon=1e-5):
 
 class YOLO:
 
-    def init(self, frame_width, frame_height, doImage, doWrite, timestamp, camSpecs):
-        os.chdir('C:/Yolo_v4/darknet/build/darknet/x64/')
-        configPath = './cfg/yolov4-tiny.cfg'
-        weightPath = './weights/yolov4-tiny.weights'
-        #configPath = './cfg/yolov4.cfg'
-        #weightPath = './weights/yolov4.weights'
-        metaPath = './cfg/coco.data'
+    def init(self, frame_width, frame_height, doImage, doWrite, darknetPath, tinyYolo, timestamp, camSpecs):
 
+        # Darknet stuff
+        os.chdir('C:/Yolo_v4/darknet/build/darknet/x64/')
+        metaPath = './cfg/coco.data'
+        if tinyYolo:
+            configPath = './cfg/yolov4-tiny.cfg'
+            weightPath = './weights/yolov4-tiny.weights'
+        else:
+            configPath = './cfg/yolov4.cfg'
+            weightPath = './weights/yolov4.weights'
+
+        # Set up the parameters for darknet
         self.network, self.class_names, self.class_colors = darknet.load_network(
             configPath,
             metaPath,
             weightPath,
             batch_size=1
         )
+
+        # Set up parameters for our camera and images
         self.cameraSpecs = camSpecs
         self.frame_height = frame_height
         self.frame_width = frame_width
-        self.showImage = doImage
-        self.write = doWrite
-        if self.write:
-            self.out = cv2.VideoWriter('output.avi', (cv2.VideoWriter_fourcc)(*'MJPG'), 10.0, (
-             self.frame_width, self.frame_height))
-        print('Starting YOLO...')
+
+        # Set other parameters for the class
         self.darknet_image = darknet.make_image(frame_width, frame_height, 3)
         self.trackedList = []
         self.id = 0
         self.time = 0
         self.prev_time = timestamp
+
+        # Save debug parameters
+        self.showImage = doImage
+        self.write = doWrite
+
+        # If we have set this to create an output video, create the video
+        if self.write:
+            self.out = cv2.VideoWriter('output.avi', (cv2.VideoWriter_fourcc)(*'MJPG'), 10.0, (
+             self.frame_width, self.frame_height))
+
+        # If we have set this to show the output via opencv, start that here
+        # Note this is really slow on the Nano better to look using the URL
         if self.showImage:
             cv2.startWindowThread()
             cv2.namedWindow('Demo')
 
+        # Indicate our success
+        print('Started YOLO successfully...')
+
     def cvDrawBoxes(self, detections, img, timestamp):
+        # Definition of colors for boudning boxes
         color_dict = {'person':[
           0, 255, 255], 
          'bicycle':[238, 123, 158],  'car':[24, 245, 217],  'motorbike':[224, 119, 227],  'aeroplane':[
@@ -381,11 +421,11 @@ class YOLO:
                     elif name_tag == 'truck':
                         trucks += 1
                         total += 1
-                        ObjectHeight = 3.0
+                        ObjectHeight = 2.5
                     elif name_tag == 'bus':
                         buses += 1
                         total += 1
-                        ObjectHeight = 3.0
+                        ObjectHeight = 2.5
                     else:
                         ObjectHeight = 1.8
                     ObjectHeightOnSensor = self.cameraSpecs.cameraHeight * h / self.cameraSpecs.imageHeight
@@ -680,7 +720,9 @@ def video_feed():
 if __name__ == '__main__':
     # Parse some arguements
     parser = argparse.ArgumentParser(description='Detect vehicles ahead and warn of impending collision, can be run on camera or prerecorded video on Jetson Nano.')
-    parser.add_argument("--recorded", help="set the input as a pre-recorded video")
+    parser.add_argument("--recorded", type=String, help="set the input as a pre-recorded video")
+    parser.add_argument("--vehicle", help="set the input as a pre-recorded video")
+    parser.add_argument("--trafficcam", help="set the input as a pre-recorded video")
     parser.add_argument('--height', type=float)
     parser.add_argument('--angle', type=float)
     args = parser.parse_args()
