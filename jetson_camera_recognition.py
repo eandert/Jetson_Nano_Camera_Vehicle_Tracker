@@ -6,14 +6,17 @@ import threading
 import nanocamera as nano
 import argparse
 from sklearn.neighbors import BallTree
+import matplotlib.pyplot as plt
+import io
 # Change folder so we can find where darknet is stored
 # Uncomment only if darknet is not in the same folder as this python file
-sys.path.insert(1, 'C:/Yolo_v4/darknet/build/darknet/x64')
+sys.path.insert(0, 'C:/Yolo_v4/darknet/build/darknet/x64')
 import darknet
 
 app = Flask(__name__)
 
 outputFrame = None
+outputCoordinates = None
 lock = threading.Lock()
 
 KDTREESEARCH_LIMIT = 10000
@@ -50,21 +53,35 @@ class CameraSpecifications:
             self.focalLength = self.imageHeight / 2 / math.tan(self.vFOV / 2.0)
 
 
+class Settings:
+    def __init__(self):
+        self.doImage = False
+        self.doWrite = False
+        self.tinyYolo = True
+        self.suppressDebug = True
+        self.forwardCollisionWarning = False
+        self.darknetPath = ""
+        self.plot = True
+        self.useCamera = False
+
+
 class Tracked:
+    # This object tracks a single object that has been detected in a video frame.
+    # We use this primarily to match objects seen between frames and included in here
+    # is a function for kalman filter to smooth the x and y values as well as a
+    # function for prediction where the next bounding box will be based on prior movement.
     def __init__(self, xmin, ymin, xmax, ymax, type, confidence, x, y, crossSection, time, id):
         self.xmin = xmin
         self.ymin = ymin
         self.xmax = xmax
         self.ymax = ymax
-        self.x = x# * 0.3048
-        self.y = y# * 0.3048
+        self.x = x
+        self.y = y
         self.lastX = self.x
         self.lastY = self.y
         self.dX = 0.0
         self.dY = 0.0
         self.timeToIntercept = 0.0
-        #self.width = width
-        #self.height = height
         self.typeArray = [0, 0, 0, 0]
         self.typeArray[type] += 1
         self.type = self.typeArray.index(max(self.typeArray))
@@ -157,6 +174,8 @@ class Tracked:
             for v in self.lastVelocity: sum += v
             self.velocity = sum/self.lastHistory
 
+        # Calcute the cahnge in x and change in y, we will use this for the timeToIntercept
+        # variable which will be used in the case of forward collision warning.
         if self.x != self.lastX:
             self.dX = (0.3*self.dX) + (0.7*(self.x - self.lastX))
         if self.y != self.lastY:
@@ -186,12 +205,15 @@ class Tracked:
         return [
          self.xmin, self.ymin, self.xmax, self.ymax]
 
+    # Gets our predicted position in an array form so we can use it in the BallTree
     def getPositionPredicted(self):
         return [
          self.xminp, self.yminp, self.xmaxp, self.ymaxp]
 
+    # Calcualtes our estimated next bounding box position velicity variables dxmin/max and dymin/max
+    # using the previous x and y values
     def calcEstimatedPos(self, timePassed):
-        # A rolling average seems most effective for this as it can change rapidly
+        # A moving average window of 3 seems most effective for this as it can change rapidly
         if self.lastHistory >= 2:
             dxmin = (0.7 * (self.xmin - self.lastXmin) / (timePassed)) + (
                         0.3 * (self.lastXmin - self.lastX2min) / (self.lastTimePassed))
@@ -217,6 +239,7 @@ class Tracked:
             #print("yp, y ", self.yp, self.y)
             self.lastTimePassed = timePassed
             return
+        # When we have onle 1 history that math changes
         if self.lastHistory == 1:
             dxmin = (self.xmin - self.lastXmin)/(timePassed)
             dymin = (self.ymin - self.lastYmin)/(timePassed)
@@ -238,6 +261,8 @@ class Tracked:
             #print("yp, y ", self.yp, self.y)
             self.lastTimePassed = timePassed
             return
+        # When we just initialized the object there is no math as we have no history
+
         if self.lastHistory == 0:
             self.lastXmin = self.xmin
             self.lastYmin = self.ymin
@@ -250,15 +275,15 @@ class Tracked:
             return
 
 def convertBack(x, y, w, h):
+    # Converts xmin ymin xmax ymax to centroid x,y with height and width
     xmin = int(round(x - w / 2))
     xmax = int(round(x + w / 2))
     ymin = int(round(y - h / 2))
     ymax = int(round(y + h / 2))
-    return (
-     xmin, ymin, xmax, ymax)
+    return (xmin, ymin, xmax, ymax)
 
 def computeDistance(a, b, epsilon=1e-5):
-    # Shamelessly copied from tutorial http://ronny.rest/tutorials/module/localization_001/iou/#
+    # From tutorial http://ronny.rest/tutorials/module/localization_001/iou/#
     """ Given two boxes `a` and `b` defined as a list of four numbers:
             [x1,y1,x2,y2]
         where:
@@ -305,12 +330,12 @@ def computeDistance(a, b, epsilon=1e-5):
 
 class YOLO:
 
-    def init(self, frame_width, frame_height, doImage, doWrite, darknetPath, tinyYolo, timestamp, camSpecs):
+    def init(self, frame_width, frame_height, timestamp, settings, camSpecs):
 
         # Darknet stuff
-        os.chdir('C:/Yolo_v4/darknet/build/darknet/x64/')
+        os.chdir(settings.darknetPath)
         metaPath = './cfg/coco.data'
-        if tinyYolo:
+        if settings.tinyYolo:
             configPath = './cfg/yolov4-tiny.cfg'
             weightPath = './weights/yolov4-tiny.weights'
         else:
@@ -338,8 +363,11 @@ class YOLO:
         self.prev_time = timestamp
 
         # Save debug parameters
-        self.showImage = doImage
-        self.write = doWrite
+        self.showImage = settings.doImage
+        self.write = settings.doWrite
+        self.suppressDebug = settings.suppressDebug
+        self.forwardCollisionWarning = settings.forwardCollisionWarning
+        self.plot = settings.plot
 
         # If we have set this to create an output video, create the video
         if self.write:
@@ -356,7 +384,7 @@ class YOLO:
         print('Started YOLO successfully...')
 
     def cvDrawBoxes(self, detections, img, timestamp):
-        # Definition of colors for boudning boxes
+        # Definition of colors for bounding boxes
         color_dict = {'person':[
           0, 255, 255], 
          'bicycle':[238, 123, 158],  'car':[24, 245, 217],  'motorbike':[224, 119, 227],  'aeroplane':[
@@ -451,16 +479,19 @@ class YOLO:
                 pt1 = (detection.xmin, detection.ymin)
                 pt2 = (detection.xmax, detection.ymax)
                 color = color_dict[tracked_items[detection.type]]
-                if -0.5 <= detection.x <= 0.5 and 0.0 <= detection.timeToIntercept <= 2.5:
+                if self.forwardCollisionWarning and -0.5 <= detection.x <= 0.5 and 0.0 <= detection.timeToIntercept <= 2.5:
                     cv2.rectangle(img, pt1, pt2, [255, 0, 0], -1)
                     cv2.putText(img, str(
                         round(detection.timeToIntercept, 2)), (
                                     pt1[0], pt1[1] + 25), cv2.FONT_HERSHEY_SIMPLEX, 1.5, [255, 255, 255], 2)
                 else:
                     cv2.rectangle(img, pt1, pt2, color, 1)
-                cv2.putText(img, str(detection.id) + ' t:' + str(tracked_items[detection.type]) + ' x:' + str(
-                    round(detection.x, 2)) + ' y:' + str(round(detection.y, 2)), (
-                                pt1[0], pt1[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    if self.suppressDebug:
+                        cv2.putText(img, str(detection.id), (pt1[0], pt1[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    else:
+                        cv2.putText(img, str(detection.id) + ' t:' + str(tracked_items[detection.type]) + ' x:' + str(
+                            round(detection.x, 2)) + ' y:' + str(round(detection.y, 2)), (
+                                        pt1[0], pt1[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
         return img
 
@@ -473,14 +504,20 @@ class YOLO:
         detections = darknet.detect_image(self.network, self.class_names, self.darknet_image, thresh=0.25)
         image = self.cvDrawBoxes(detections, frame_resized, timestamp)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        self.prev_time = timestamp
         if self.showImage:
             cv2.imshow('Demo', image)
             if cv2.waitKey(1) == 27:
                 exit(0)
         if self.write:
             self.out.write(image)
-        self.prev_time = timestamp
-        return image
+        result = []
+        if self.plot:
+            for track in self.trackedList:
+                if track.lastHistory >= 5:
+                    result.append([track.id, track.x, track.y, track.crossSection, track.velocity])
+        return image, timestamp, result
+
 
     def matchDetections(self, detections_list_positions, detection_list, timestamp):
         self.time += 1
@@ -591,7 +628,7 @@ class YOLO:
         remove = []
         for idx, track in enumerate(self.trackedList):
             track.relations = []
-            if track.lastTracked < self.time - 5:
+            if track.lastTracked < self.time - 2:
                 remove.append(idx)
 
         for delete in reversed(remove):
@@ -601,14 +638,14 @@ class YOLO:
         self.out.release()
 
 
-def processImages(useCamera, camSpecs):
+def processImages(settings, camSpecs):
     firstIteration = True
     yolo = None
 
     # grab global references to the output frame and lock variables
     global outputFrame, lock
 
-    if useCamera:
+    if settings.useCamera:
         # Create the Camera instance
         camera = nano.Camera(flip=2, width=1280, height=720, fps=30)
         print('CSI Camera ready? - ', camera.isReady())
@@ -620,7 +657,7 @@ def processImages(useCamera, camSpecs):
                     # Setup the variables we need, hopefully this function stays active
                     yolo = YOLO()
                     height, width = frame_read.shape[:2]
-                    yolo.init(width, height, False, False, time.time(), camSpecs)
+                    yolo.init(width, height, time.time(), settings, camSpecs)
                     firstIteration = False
 
                     # Now that the init is done, lets get our IP and print to terminal so we know where to connect
@@ -630,10 +667,12 @@ def processImages(useCamera, camSpecs):
                          [socket.socket(socket.AF_INET, socket.SOCK_DGRAM)]][0][1]]) if l][0][0]
                     print("Please connect to http://" + str(myip) + ":5000 to see the video feed.")
                 else:
-                    result = yolo.readFrame(frame_read, time.time())
+                    image, timestamp, coordinates = yolo.readFrame(frame_read, time.time())
                     with lock:
-                        if result is not None:
-                            outputFrame = result.copy()
+                        if image is not None:
+                            outputFrame = image.copy()
+                        if coordinates is not None:
+                            outputCoordinates = coordinates
                     # Sleep just a bit so control-c works
                     time.sleep(.001)
                 if cv2.waitKey(25) & 0xFF == ord('q'):
@@ -648,7 +687,7 @@ def processImages(useCamera, camSpecs):
         del camera
     else:
         #os.chdir("A:\\Users\edwar\Downloads")
-        cap = cv2.VideoCapture("video.avi")  # Local Stored video detection - Set input video
+        cap = cv2.VideoCapture("freeway.avi")  # Local Stored video detection - Set input video
 
         currentTime = 0.0
         fps = 30.0
@@ -668,24 +707,51 @@ def processImages(useCamera, camSpecs):
                     # Setup the variables we need, hopefully this function stays active
                     yolo = YOLO()
                     height, width = frame_read.shape[:2]
-                    yolo.init(width, height, False, False, currentTime, camSpecs)
+                    yolo.init(width, height, time.time(), settings, camSpecs)
                     firstIteration = False
 
                     # Now that the init is done, lets get our IP and print to terminal so we know where to connect
                     myip = [l for l in ([ip for ip in socket.gethostbyname_ex(socket.gethostname())[2] if not ip.startswith("127.")][:1], [[(s.connect(('8.8.8.8', 53)), s.getsockname()[0], s.close()) for s in [socket.socket(socket.AF_INET, socket.SOCK_DGRAM)]][0][1]]) if l][0][0]
                     print("Please connect to http://" + str(myip) + ":5000 to see the video feed.")
                 else:
-                    result = yolo.readFrame(frame_read, currentTime)
+                    image, timestamp, coordinates = yolo.readFrame(frame_read, time.time())
                     with lock:
-                        if result is not None:
-                            outputFrame = result.copy()
+                        if image is not None:
+                            outputFrame = image.copy()
+                        if coordinates is not None:
+                            outputCoordinates = coordinates
                     currentTime += 1.0 / fps
                     # Sleep just a bit so control-c works
                     time.sleep(.001)
                 if cv2.waitKey(25) & 0xFF == ord('q'):
                     break
 
-def generate():
+def plotImage(coordinates):
+    # Local storage for the points
+    pointsX = []
+    pointsY = []
+
+    for point in coordinates:
+        pointsX.append(point[1])
+        pointsY.append(point[2])
+
+    # Use to plot track map
+    plt.figure()
+    plt.axis([-50, 50, 0, 200])
+    plt.plot(pointsX, pointsY, 'ro')
+    # naming the x axis
+    plt.xlabel('x - axis')
+    # naming the y axis
+    plt.ylabel('y - axis')
+    # giving a title to my graph
+    plt.title('Tracks graph!')
+    fig = plt.gcf()
+    buf = io.BytesIO()
+    fig.savefig(buf, format='jpeg')
+    buf.seek(0)
+    return buf
+
+def generateImage():
     # grab global references to the output frame and lock variables
     global outputFrame, lock
     # loop over frames from the output stream
@@ -698,7 +764,28 @@ def generate():
                 continue
             # encode the frame in JPEG format
             (flag, encodedImage) = cv2.imencode(".jpg", outputFrame)
-            # ensure the frame was successfully encoded
+            # encode the plot frame in JPEG format
+            if not flag:
+                continue
+        # yield the output frame in the byte format
+        yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' +
+               bytearray(encodedImage) + b'\r\n')
+
+def generatePlot():
+    # grab global references to the output frame and lock variables
+    global outputCoordinates, lock
+    # loop over frames from the output stream
+    while True:
+        # wait until the lock is acquired
+        with lock:
+            # check if the output frame is available, otherwise skip
+            # the iteration of the loop
+            if outputCoordinates is None:
+                continue
+            plot = plotImage(outputCoordinates)
+            # encode the frame in JPEG format
+            (flag, encodedImage) = cv2.imencode(".jpg", plot)
+            # encode the plot frame in JPEG format
             if not flag:
                 continue
         # yield the output frame in the byte format
@@ -714,27 +801,39 @@ def index():
 def video_feed():
     # return the response generated along with the specific media
     # type (mime type)
-    return Response(generate(),
+    return Response(generateImage(),
+        mimetype = "multipart/x-mixed-replace; boundary=frame")
+
+@app.route("/plot_feed")
+def plot_feed():
+    # return the response generated along with the specific media
+    # type (mime type)
+    return Response(generatePlot(),
         mimetype = "multipart/x-mixed-replace; boundary=frame")
 
 if __name__ == '__main__':
     # Parse some arguements
     parser = argparse.ArgumentParser(description='Detect vehicles ahead and warn of impending collision, can be run on camera or prerecorded video on Jetson Nano.')
-    parser.add_argument("--recorded", type=String, help="set the input as a pre-recorded video")
-    parser.add_argument("--vehicle", help="set the input as a pre-recorded video")
-    parser.add_argument("--trafficcam", help="set the input as a pre-recorded video")
+    #parser.add_argument("--recorded", type=String, help="set the input as a pre-recorded video")
+    parser.add_argument("-vehicle", help="set the input as a pre-recorded video")
+    parser.add_argument("-trafficcam", help="set the input as a pre-recorded video")
     parser.add_argument('--height', type=float)
     parser.add_argument('--angle', type=float)
+
     args = parser.parse_args()
 
+    settings = Settings()
+    settings.darknetPath = 'C:/Yolo_v4/darknet/build/darknet/x64/'
+
     camSpecs = CameraSpecifications()
-    #if args.height:
-    #    camSpecs.cameraHeight = args.height
-    #if args.angle:
-    #    camSpecs.cameraAdjustmentAngle = args.angle
+    if args.height:
+       camSpecs.cameraHeight = args.height
+    if args.angle:
+       camSpecs.cameraAdjustmentAngle = args.angle
 
     # start a thread that will perform motion detection
-    t = threading.Thread(target=processImages, args=(args.recorded, camSpecs, ))
+    #t = threading.Thread(target=processImages, args=(args.recorded, camSpecs, ))
+    t = threading.Thread(target=processImages, args=(settings, camSpecs,))
     t.daemon = True
     t.start()
 
