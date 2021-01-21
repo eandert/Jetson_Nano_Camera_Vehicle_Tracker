@@ -25,8 +25,12 @@ We will not go into details here as the steps are very similar to the Jetson Nan
 ## Downloading the AVI files if you do not have a camera on the Jetson Nano or are wantign to run from pre-recorded footage
 
 You can download the following pre recorded video files for use with this repo so that it can be used without a Jetson Camera:
-[[https://drive.google.com/file/d/12MKBTURDOkKL8O1F8-N4G40rWjp_SmGs/view?usp=sharing|Freeway Video]]
-[[https://drive.google.com/file/d/1M1roYX4DFLg403jTQiz0ZsQ9qnwvytgo/view?usp=sharing|In Car Video]]
+ * [Freeway Video](https://drive.google.com/file/d/12MKBTURDOkKL8O1F8-N4G40rWjp_SmGs/view?usp=sharing)
+ * [In Car Video](https://drive.google.com/file/d/1M1roYX4DFLg403jTQiz0ZsQ9qnwvytgo/view?usp=sharing)
+
+The following are recorded outputs that you can expect from the various settings using the pre-recorded video files:
+ * [Freeway Video Yolov4 Tiny](https://drive.google.com/file/d/1JwWT1EKlWOqTKZCoDnC8k81-qbyL3Y6A/view?usp=sharing)
+ * [Freeway Video Yolov4](https://drive.google.com/file/d/1F_4pNioTDJ8xbgJW0E8fmnHgXNwmZDmf/view?usp=sharing)
 
 ## Running the code
 There are many different command line options for running this. Those can be found by running `python jetson_camera_recognition.py --help` however below outlines some of the common ways to run this code.
