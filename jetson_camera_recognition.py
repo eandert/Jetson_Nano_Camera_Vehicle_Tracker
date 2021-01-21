@@ -55,14 +55,16 @@ class CameraSpecifications:
 
 class Settings:
     def __init__(self):
-        self.doImage = False
-        self.doWrite = False
+        self.opencvrender = False
+        self.record = False
         self.tinyYolo = True
         self.suppressDebug = True
         self.forwardCollisionWarning = False
         self.darknetPath = ""
         self.plot = True
         self.useCamera = False
+        self.inputFilename = ""
+        self.outputFilename = ""
 
 
 class Tracked:
@@ -363,15 +365,15 @@ class YOLO:
         self.prev_time = timestamp
 
         # Save debug parameters
-        self.showImage = settings.doImage
-        self.write = settings.doWrite
+        self.showImage = settings.opencvrender
+        self.write = settings.record
         self.suppressDebug = settings.suppressDebug
         self.forwardCollisionWarning = settings.forwardCollisionWarning
         self.plot = settings.plot
 
         # If we have set this to create an output video, create the video
         if self.write:
-            self.out = cv2.VideoWriter('output.avi', (cv2.VideoWriter_fourcc)(*'MJPG'), 10.0, (
+            self.out = cv2.VideoWriter(settings.self.outputFilename, (cv2.VideoWriter_fourcc)(*'MJPG'), 10.0, (
              self.frame_width, self.frame_height))
 
         # If we have set this to show the output via opencv, start that here
@@ -687,10 +689,11 @@ def processImages(settings, camSpecs):
         del camera
     else:
         #os.chdir("A:\\Users\edwar\Downloads")
-        cap = cv2.VideoCapture("freeway.avi")  # Local Stored video detection - Set input video
+        print ( "Opening captured video file ", settings.inputFilename)
+        cap = cv2.VideoCapture(settings.inputFilename)  # Local Stored video detection - Set input video
 
         currentTime = 0.0
-        fps = 30.0
+        fps = 10.0
 
         while True:  # Load the input frame and write output frame.
             ret, frame_read = cap.read()  # Capture frame and return true if frame present
@@ -815,15 +818,45 @@ if __name__ == '__main__':
     # Parse some arguements
     parser = argparse.ArgumentParser(description='Detect vehicles ahead and warn of impending collision, can be run on camera or prerecorded video on Jetson Nano.')
     #parser.add_argument("--recorded", type=String, help="set the input as a pre-recorded video")
-    parser.add_argument("-vehicle", help="set the input as a pre-recorded video")
-    parser.add_argument("-trafficcam", help="set the input as a pre-recorded video")
-    parser.add_argument('--height', type=float)
-    parser.add_argument('--angle', type=float)
+    # Arguments for general settings
+    parser.add_argument("--playback", default="", action='store', required=False, type=str, help="Set the input as a pre-recorded video with this filename, should be .avi. Defaults to false which sets the input as the Jetson Nano camera.")
+    parser.add_argument("--record", default="", action='store', required=False, type=str, help="Write the output to this file name, should be a .avi")
+    parser.add_argument("--opencvrender", action='store_true', required=False, default=False, help="Render video to window using OpenCV, this will be very slow on the Jetson and defaults to false.")
+    parser.add_argument("--debug", action='store_true', required=False, default=False, help="Print debug messages to the terminal")
+    parser.add_argument("--collisionwarning", action='store_true', required=False, default=False, help="This sets the recognition to forward collision mode where we check if there will be a collision vith vehicles in front of us in the next 2.5 seconds")
+    parser.add_argument("--darknetpath", default="", action='store', required=False, type=str, help="Path to the location of darknet, default is the location of this python script")
+    parser.add_argument("--notinyyolo", action='store_true', required=False, default=False, help="Sets the use of full YOLOv4 instead of using tiny which is the default. This will run at a slower framerate than tiny but is more accurate.")
+    parser.add_argument("--noplot", action='store_true', required=False, default=False, help="Turns off plot printing to webpage, could increase speed")
+    parser.add_argument("--novideo", action='store_true', required=False, default=False, help="Turns off video printing to webpage, could increase speed")
+    # Arguments for camera settings
+    parser.add_argument('--height', default="", action='store', required=False, type=str, help="Set a different height for the camera, this will affect the detected range of objects")
+    parser.add_argument('--angle', default="", action='store', required=False, type=str, help="Set a different angle of the camera, this is important when forward collision detection is enabled as it only detects collisions within roughly a single lane width straight ahead.")
 
     args = parser.parse_args()
 
+    # Setup our various settings and get them from the argparser
     settings = Settings()
-    settings.darknetPath = 'C:/Yolo_v4/darknet/build/darknet/x64/'
+    #settings.darknetPath = 'C:/Yolo_v4/darknet/build/darknet/x64/'
+    settings.darknetPath = args.darknetpath
+    settings.opencvrender = args.opencvrender
+    settings.tinyYolo = not args.notinyyolo
+    settings.record = args.record
+    settings.forwardCollisionWarning = args.collisionwarning
+    # Check if we want to use the camera or playback a video
+    if args.playback:
+        settings.useCamera = False
+        settings.inputFilename = args.playback
+    else:
+        settings.useCamera = True
+    # Check if we are recording and if so set the filename
+    if args.record:
+        settings.record = True
+        settings.outputFilename = args.record
+    else:
+        settings.record = False
+    settings.webpageplot = not args.noplot
+    settings.webpadevideo = not args.novideo
+    settings.suppressDebug = not args.debug
 
     camSpecs = CameraSpecifications()
     if args.height:
@@ -832,7 +865,6 @@ if __name__ == '__main__':
        camSpecs.cameraAdjustmentAngle = args.angle
 
     # start a thread that will perform motion detection
-    #t = threading.Thread(target=processImages, args=(args.recorded, camSpecs, ))
     t = threading.Thread(target=processImages, args=(settings, camSpecs,))
     t.daemon = True
     t.start()
