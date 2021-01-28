@@ -4,6 +4,10 @@ This repository contains a YoloV4/Darknet based image classifier coded to run on
 
 This repository is still in the works so please bear with the bad instructions right now as I update them.
 
+Hardware:
+ * Procesor: Nvidia Jetson Nano 4GB
+ * Camera: IMX219 160
+
 ## Preparing the Jeston Nano
 Rather than re-inventing the wheel, I would suggest you follow the instructions outlined here to set up your Nvidia Jetson Nano for image processing. We will not need tensorflow, however we do require OpenCV and SkiKitLearn so make sure you get through that part. I find this guide is the best - you may be able to follow another one. https://www.pyimagesearch.com/2020/03/25/how-to-configure-your-nvidia-jetson-nano-for-computer-vision-and-deep-learning/
 
